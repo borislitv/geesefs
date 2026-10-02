@@ -835,6 +835,7 @@ func (inode *Inode) sendRename() {
 				} else if mappedErr == syscall.ENOENT || mappedErr == syscall.ERANGE {
 					s3Log.Warnf("Conflict detected (inode %v): failed to copy %v to %v: %v. File is removed remotely, dropping cache", inode.Id, from, key, err)
 					inode.mu.Lock()
+					inode.recordFlushError(err)
 					newParent := inode.Parent
 					oldParent := inode.oldParent
 					oldName := inode.oldName
@@ -878,6 +879,7 @@ func (inode *Inode) sendRename() {
 				delParent := oldParent
 				delName := oldName
 				inode.mu.Lock()
+				inode.recordFlushError(nil)
 				// Now we know that the object is accessible by the new name
 				if inode.Parent == newParent && inode.Name == newName {
 					// Just clear the old path
@@ -1843,13 +1845,14 @@ func (inode *Inode) SyncFile() (err error) {
 	for {
 		inode.mu.Lock()
 		inode.forceFlush = false
-		if inode.CacheState <= ST_DEAD {
-			inode.mu.Unlock()
-			break
-		}
+		// A failed flush can discard local cache; that is not successful persistence.
 		if inode.flushError != nil {
 			// Return the error to user
 			err = inode.flushError
+			inode.mu.Unlock()
+			break
+		}
+		if inode.CacheState <= ST_DEAD {
 			inode.mu.Unlock()
 			break
 		}
