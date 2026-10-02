@@ -1144,7 +1144,9 @@ func (fs *Goofys) SyncTree(parent *Inode) (err error) {
 		inode := fs.inodes[id]
 		fs.mu.RUnlock()
 		if inode != nil {
-			inode.SyncFile()
+			if syncErr := inode.SyncFile(); err == nil {
+				err = syncErr
+			}
 		}
 	}
 	return

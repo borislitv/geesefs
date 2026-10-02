@@ -297,6 +297,9 @@ Linux and POSIX behaviour where fsync-ing a directory only flushes directory ent
 (i.e., renamed files) in it.
 
 If a server or network error occurs during `fsync`, the caller receives an error code.
+This includes failed metadata self-copies and asynchronous renames whose conflict
+handling discards the local cache. Directory fsync continues flushing other entries
+and reports the first persistence error.
 
 Example of calling `fsync`. Note that both directories and files should be opened as files:
 
