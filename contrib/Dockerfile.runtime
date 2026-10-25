@@ -1,0 +1,6 @@
+FROM scratch
+ARG VCS_REF
+LABEL org.opencontainers.image.source="https://github.com/borislitv/geesefs" \
+      org.opencontainers.image.revision="${VCS_REF}"
+COPY geesefs /geesefs
+ENTRYPOINT ["/geesefs"]

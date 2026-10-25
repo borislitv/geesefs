@@ -133,7 +133,11 @@ type Inode struct {
 
 	userMetadataDirty int
 	userMetadata      map[string][]byte
-	s3Metadata        map[string][]byte
+	// Cloud xattrs have exactly two keys. Keep them inline rather than retaining
+	// a map and its pointer-rich buckets for every cached inode. Nil means absent;
+	// an empty, non-nil slice is still a present xattr.
+	s3ETag         []byte
+	s3StorageClass []byte
 
 	// last known size and etag from the cloud
 	knownSize uint64
@@ -164,10 +168,9 @@ func NewInode(fs *Goofys, parent *Inode, name string) (inode *Inode) {
 			Gid:  fs.flags.Gid,
 			Mode: fs.flags.FileMode,
 		},
-		AttrTime:   time.Now(),
-		Parent:     parent,
-		s3Metadata: make(map[string][]byte),
-		refcnt:     0,
+		AttrTime: time.Now(),
+		Parent:   parent,
+		refcnt:   0,
 	}
 
 	inode.buffers.helpers = inode
@@ -230,15 +233,19 @@ func (inode *Inode) SetFromBlobItem(item *BlobItemOutput) {
 		}
 	}
 	if item.ETag != nil {
-		inode.s3Metadata["etag"] = []byte(*item.ETag)
+		if inode.s3ETag == nil || string(inode.s3ETag) != *item.ETag {
+			inode.s3ETag = []byte(*item.ETag)
+		}
 		inode.knownETag = *item.ETag
 	} else {
-		delete(inode.s3Metadata, "etag")
+		inode.s3ETag = nil
 	}
 	if item.StorageClass != nil {
-		inode.s3Metadata["storage-class"] = []byte(*item.StorageClass)
+		if inode.s3StorageClass == nil || string(inode.s3StorageClass) != *item.StorageClass {
+			inode.s3StorageClass = []byte(*item.StorageClass)
+		}
 	} else {
-		delete(inode.s3Metadata, "storage-class")
+		inode.s3StorageClass = nil
 	}
 	now := time.Now()
 	// don't want to update time if this inode is setup to never expire
@@ -481,12 +488,12 @@ func RetryHeadBlob(flags *cfg.FlagStorage, cloud StorageBackend, req *HeadBlobIn
 // LOCKS_REQUIRED(inode.mu)
 func (inode *Inode) fillXattrFromHead(resp *HeadBlobOutput) {
 	if resp.ETag != nil {
-		inode.s3Metadata["etag"] = []byte(*resp.ETag)
+		inode.s3ETag = []byte(*resp.ETag)
 	}
 	if resp.StorageClass != nil {
-		inode.s3Metadata["storage-class"] = []byte(*resp.StorageClass)
+		inode.s3StorageClass = []byte(*resp.StorageClass)
 	} else {
-		inode.s3Metadata["storage-class"] = []byte("STANDARD")
+		inode.s3StorageClass = []byte("STANDARD")
 	}
 
 	inode.setMetadata(resp.Metadata)
@@ -648,19 +655,14 @@ func (inode *Inode) fillXattr() (err error) {
 }
 
 // LOCKS_REQUIRED(inode.mu)
-func (inode *Inode) getXattrMap(name string, userOnly bool) (
+func (inode *Inode) getUserXattrMap(name string) (
 	meta map[string][]byte, newName string, err error) {
 
 	cloud, _ := inode.cloud()
 	xattrPrefix := cloud.Capabilities().Name + "."
 
 	if strings.HasPrefix(name, xattrPrefix) {
-		if userOnly {
-			return nil, "", syscall.EPERM
-		}
-
-		newName = name[len(xattrPrefix):]
-		meta = inode.s3Metadata
+		return nil, "", syscall.EPERM
 	} else if strings.HasPrefix(name, "user.") && name != "user."+inode.fs.flags.SymlinkAttr {
 		err = inode.fillXattr()
 		if err != nil {
@@ -670,11 +672,7 @@ func (inode *Inode) getXattrMap(name string, userOnly bool) (
 		newName = name[5:]
 		meta = inode.userMetadata
 	} else {
-		if userOnly {
-			return nil, "", syscall.EPERM
-		} else {
-			return nil, "", ENOATTR
-		}
+		return nil, "", syscall.EPERM
 	}
 
 	if meta == nil {
@@ -726,7 +724,7 @@ func (inode *Inode) SetXattr(name string, value []byte, flags uint32) error {
 		return syscall.ENOENT
 	}
 
-	meta, name, err := inode.getXattrMap(name, true)
+	meta, name, err := inode.getUserXattrMap(name)
 	if err == syscall.EPERM {
 		// Silently ignore forbidden xattr operations
 		return nil
@@ -768,7 +766,7 @@ func (inode *Inode) RemoveXattr(name string) error {
 		return syscall.ENOENT
 	}
 
-	meta, name, err := inode.getXattrMap(name, true)
+	meta, name, err := inode.getUserXattrMap(name)
 	if err == syscall.EPERM {
 		// Silently ignore forbidden xattr operations
 		return nil
@@ -799,7 +797,26 @@ func (inode *Inode) GetXattr(name string) ([]byte, error) {
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
 
-	meta, name, err := inode.getXattrMap(name, false)
+	cloud, _ := inode.cloud()
+	xattrPrefix := cloud.Capabilities().Name + "."
+	if strings.HasPrefix(name, xattrPrefix) {
+		var value []byte
+		switch name[len(xattrPrefix):] {
+		case "etag":
+			value = inode.s3ETag
+		case "storage-class":
+			value = inode.s3StorageClass
+		}
+		if value == nil {
+			return nil, ENOATTR
+		}
+		return value, nil
+	}
+
+	meta, name, err := inode.getUserXattrMap(name)
+	if err == syscall.EPERM {
+		return nil, ENOATTR
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -826,8 +843,11 @@ func (inode *Inode) ListXattr() ([]string, error) {
 	cloud, _ := inode.cloud()
 	cloudXattrPrefix := cloud.Capabilities().Name + "."
 
-	for k, _ := range inode.s3Metadata {
-		xattrs = append(xattrs, cloudXattrPrefix+k)
+	if inode.s3ETag != nil {
+		xattrs = append(xattrs, cloudXattrPrefix+"etag")
+	}
+	if inode.s3StorageClass != nil {
+		xattrs = append(xattrs, cloudXattrPrefix+"storage-class")
 	}
 
 	for k, _ := range inode.userMetadata {

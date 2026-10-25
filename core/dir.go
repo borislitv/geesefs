@@ -945,7 +945,8 @@ func (inode *Inode) ResetForUnmount() {
 	// we know to fetch them again next time instead of thinking there's
 	// no metadata
 	inode.userMetadata = nil
-	inode.s3Metadata = nil
+	inode.s3ETag = nil
+	inode.s3StorageClass = nil
 	inode.Attributes = InodeAttributes{}
 	inode.dir.ImplicitDir = false
 	inode.mu.Unlock()

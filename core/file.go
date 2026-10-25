@@ -1825,10 +1825,10 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 
 func (inode *Inode) updateFromFlush(size uint64, etag *string, lastModified *time.Time, storageClass *string) {
 	if etag != nil {
-		inode.s3Metadata["etag"] = []byte(*etag)
+		inode.s3ETag = []byte(*etag)
 	}
 	if storageClass != nil {
-		inode.s3Metadata["storage-class"] = []byte(*storageClass)
+		inode.s3StorageClass = []byte(*storageClass)
 	}
 	if lastModified != nil {
 		inode.Attributes.Ctime = *lastModified
