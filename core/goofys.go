@@ -890,6 +890,19 @@ func (fs *Goofys) RefreshInodeCache(inode *Inode) error {
 	inodeId := inode.Id
 	inode.mu.Unlock()
 	inode.resetDirTimeRec()
+	// Slurp ranges belong to the storage root, including when only one file or
+	// subdirectory is refreshed. They must not satisfy the explicit recheck with
+	// metadata from before the invalidation.
+	slurpRoot := inode
+	if slurpRoot.dir == nil {
+		slurpRoot = parent
+	}
+	for slurpRoot.dir.cloud == nil {
+		slurpRoot = slurpRoot.Parent
+	}
+	slurpRoot.mu.Lock()
+	slurpRoot.dir.Gaps = nil
+	slurpRoot.mu.Unlock()
 	var mappedErr error
 	var notifications []interface{}
 	if parent == nil {

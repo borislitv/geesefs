@@ -1895,6 +1895,12 @@ func (s *GoofysTest) TestReadDirSlurpSubtree(t *C) {
 	}
 	s.fs.flags.StatCacheTTL = 1 * time.Minute
 
+	// Lookup preloading may also populate earlier sibling directories. Start the
+	// sequential walk at dir1 before testing slurp in its next sibling, dir2.
+	first, err := s.fs.LookupPath("dir1")
+	t.Assert(err, IsNil)
+	s.readDirIntoCache(t, first.Id)
+
 	s.getRoot(t).dir.seqOpenDirScore = 2
 	in, err := s.fs.LookupPath("dir2")
 	t.Assert(err, IsNil)
