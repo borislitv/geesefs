@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jacobsa/fuse/fuseops"
 
@@ -60,6 +61,23 @@ type DirInodeData struct {
 	DeletedChildren map[string]*Inode
 	Gaps            []*SlurpGap
 	handles         []*DirHandle
+
+	// Protected by the containing inode's mu, like Children. The generation
+	// prevents an in-flight miss from repopulating the cache after a mutation.
+	negativeLookups  map[string]time.Time
+	lookupGeneration uint64
+}
+
+// LOCKS_REQUIRED(parent.mu)
+// An empty name invalidates the entire directory. Also reject in-flight misses
+// from before the mutation, even if they are for a different name.
+func (parent *Inode) invalidateNegativeLookupsUnlocked(name string) {
+	if name == "" {
+		parent.dir.negativeLookups = nil
+	} else {
+		delete(parent.dir.negativeLookups, name)
+	}
+	parent.dir.lookupGeneration++
 }
 
 // Returns the position of first char < '/' in `inp` after prefixLen + any continued '/' characters.
@@ -325,14 +343,26 @@ func (parent *Inode) listObjectsSlurp(inode *Inode, startAfter string, sealEnd b
 		nextStartAfter = *obj.Key
 	}
 
-	// Remember this range as already loaded
-	parent.dir.markGapLoaded(NilStr(startWith), nextStartAfter)
+	// Remember this range as already loaded. A listing that is not truncated covers
+	// everything after startWith within the prefix, not just up to its last item.
+	gapEnd := nextStartAfter
+	if !resp.IsTruncated {
+		gapEnd = prefix + "\xff"
+	}
+	parent.dir.markGapLoaded(NilStr(startWith), gapEnd)
 
 	if lock {
 		parent.mu.Unlock()
 	}
 
 	return
+}
+
+// slurpMarkerBefore returns a listing marker that sorts strictly before key, so the
+// listing includes key itself: key with its last rune removed (a proper prefix of key).
+func slurpMarkerBefore(key string) string {
+	_, size := utf8.DecodeLastRuneInString(key)
+	return key[:len(key)-size]
 }
 
 func (dir *DirInodeData) markGapLoaded(start, end string) {
@@ -356,7 +386,10 @@ func (dir *DirInodeData) markGapLoaded(start, end string) {
 		dir.Gaps[endPos-1].start = end
 		endPos--
 	}
-	l := len(dir.Gaps) - (endPos - pos)
+	// Gaps [pos, endPos) are replaced by one new gap, so the slice grows by one when
+	// nothing is replaced. Without the +1 a non-overlapping gap is appended and then
+	// sliced off again, so freshly listed ranges were never remembered.
+	l := len(dir.Gaps) - (endPos - pos) + 1
 	if pos == endPos {
 		dir.Gaps = append(dir.Gaps, nil)
 	}
@@ -880,6 +913,7 @@ func (inode *Inode) resetDirTimeRec() {
 	}
 	inode.dir.listDone = false
 	inode.dir.DirTime = time.Time{}
+	inode.invalidateNegativeLookupsUnlocked("")
 	// Make a copy of the child nodes before giving up the lock.
 	// This protects us from any addition/removal of child nodes
 	// under this node.
@@ -1014,6 +1048,7 @@ func (parent *Inode) removeChildUnlocked(inode *Inode) {
 	copy(parent.dir.Children[i:], parent.dir.Children[i+1:])
 	parent.dir.Children[l-1] = nil
 	parent.dir.Children = parent.dir.Children[:l-1]
+	parent.invalidateNegativeLookupsUnlocked(inode.Name)
 
 	if cap(parent.dir.Children) >= len(parent.dir.Children)*2 {
 		tmp := make([]*Inode, len(parent.dir.Children))
@@ -1042,6 +1077,7 @@ func (parent *Inode) removeAllChildrenUnlocked() {
 		dh.lastInternalOffset = -1
 	}
 	parent.dir.Children = nil
+	parent.invalidateNegativeLookupsUnlocked("")
 }
 
 // LOCKS_EXCLUDED(parent.fs.mu)
@@ -1073,6 +1109,7 @@ func (parent *Inode) insertChild(inode *Inode) {
 
 // LOCKS_REQUIRED(parent.mu)
 func (parent *Inode) insertChildUnlocked(inode *Inode) {
+	parent.invalidateNegativeLookupsUnlocked(inode.Name)
 	inode.Ref()
 
 	l := len(parent.dir.Children)
@@ -1898,6 +1935,8 @@ func (parent *Inode) findChildMaxTime() (maxMtime, maxCtime time.Time) {
 
 func (parent *Inode) LookUpCached(name string) (inode *Inode, err error) {
 	parent.mu.Lock()
+	lookupStart := time.Now()
+	generation := parent.dir.lookupGeneration
 	ok := false
 	inode = parent.findChildUnlocked(name)
 	if inode != nil {
@@ -1930,11 +1969,56 @@ func (parent *Inode) LookUpCached(name string) (inode *Inode, err error) {
 			parent.mu.Unlock()
 			return nil, syscall.ENOENT
 		}
+		if when, found := parent.dir.negativeLookups[name]; found {
+			if parent.fs.flags.NegativeLookupCacheSize > 0 &&
+				parent.fs.flags.StatCacheTTL > 0 && !expired(when, parent.fs.flags.StatCacheTTL) {
+				parent.mu.Unlock()
+				return nil, syscall.ENOENT
+			}
+			delete(parent.dir.negativeLookups, name)
+		}
 	}
 	parent.mu.Unlock()
 	if !ok {
 		inode, err = parent.recheckInode(inode, name)
 		err = mapAwsError(err)
+		if err == syscall.ENOENT {
+			parent.mu.Lock()
+			// A local create or a positive listing may have won the race with
+			// the backend request. Never hide that inode with a stale miss.
+			inode = parent.findChildUnlocked(name)
+			if inode == nil && generation == parent.dir.lookupGeneration &&
+				parent.fs.flags.NegativeLookupCacheSize > 0 &&
+				parent.fs.flags.StatCacheTTL > 0 && !expired(lookupStart, parent.fs.flags.StatCacheTTL) {
+				if old, found := parent.dir.negativeLookups[name]; found {
+					// Concurrent misses must not evict entries or extend TTL.
+					if lookupStart.Before(old) {
+						parent.dir.negativeLookups[name] = lookupStart
+					}
+				} else {
+					var oldestName string
+					var oldestTime time.Time
+					for cachedName, when := range parent.dir.negativeLookups {
+						if expired(when, parent.fs.flags.StatCacheTTL) {
+							delete(parent.dir.negativeLookups, cachedName)
+						} else if oldestTime.IsZero() || when.Before(oldestTime) {
+							oldestName, oldestTime = cachedName, when
+						}
+					}
+					if len(parent.dir.negativeLookups) >= parent.fs.flags.NegativeLookupCacheSize {
+						delete(parent.dir.negativeLookups, oldestName)
+					}
+					if parent.dir.negativeLookups == nil {
+						parent.dir.negativeLookups = make(map[string]time.Time)
+					}
+					parent.dir.negativeLookups[name] = lookupStart
+				}
+			}
+			parent.mu.Unlock()
+			if inode != nil {
+				return inode, nil
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1980,7 +2064,12 @@ func (parent *Inode) LookUp(name string, doSlurp bool) (*Inode, error) {
 		// The only case where it may be missing from the listing is when it's a directory
 		// and there's a lot of (more than 1000) files named "<file>[\x20-\x2E]...", because
 		// these names will come before "file/".
-		_, err := root.listObjectsSlurp(&Inode{Parent: parent}, key, false, true)
+		// List from just before the key: S3 markers are exclusive, so a listing that
+		// starts after `key` can never contain `key` itself, and the gap it records
+		// starts at `key`, which checkGapLoaded(key) does not count as covered.
+		// Without this, every negative lookup falls through to HEAD key + HEAD key/,
+		// and a 404 HEAD can take hundreds of milliseconds on some providers.
+		_, err := root.listObjectsSlurp(&Inode{Parent: parent}, slurpMarkerBefore(key), false, true)
 		if err != nil {
 			return nil, err
 		}
@@ -2026,21 +2115,31 @@ func (parent *Inode) LookUpInodeMaybeDir(name string) (*BlobItemOutput, error) {
 	var object, dirObject *HeadBlobOutput
 	var prefixList *ListBlobsOutput
 	var objectError, dirError, prefixError error
-	results := make(chan int, 3)
+	type lookupResult struct {
+		kind int
+		head *HeadBlobOutput
+		list *ListBlobsOutput
+		err  error
+	}
+	// Publish each probe's result through the channel; only this goroutine
+	// reads or writes the aggregate results, including on early success.
+	results := make(chan lookupResult, 3)
 	n := 0
 
 	for {
 		n++
 		go func() {
-			object, objectError = cloud.HeadBlob(&HeadBlobInput{Key: key})
-			results <- 1
+			resp, err := cloud.HeadBlob(&HeadBlobInput{Key: key})
+			results <- lookupResult{kind: 1, head: resp, err: err}
 		}()
 		if cloud.Capabilities().DirBlob {
-			<-results
+			result := <-results
+			object, objectError = result.head, result.err
 			break
 		}
 		if parent.fs.flags.Cheap {
-			<-results
+			result := <-results
+			object, objectError = result.head, result.err
 			if mapAwsError(objectError) != syscall.ENOENT {
 				break
 			}
@@ -2049,11 +2148,12 @@ func (parent *Inode) LookUpInodeMaybeDir(name string) (*BlobItemOutput, error) {
 		if !parent.fs.flags.NoDirObject {
 			n++
 			go func() {
-				dirObject, dirError = cloud.HeadBlob(&HeadBlobInput{Key: key + "/"})
-				results <- 2
+				resp, err := cloud.HeadBlob(&HeadBlobInput{Key: key + "/"})
+				results <- lookupResult{kind: 2, head: resp, err: err}
 			}()
 			if parent.fs.flags.Cheap {
-				<-results
+				result := <-results
+				dirObject, dirError = result.head, result.err
 				if mapAwsError(dirError) != syscall.ENOENT {
 					break
 				}
@@ -2063,15 +2163,16 @@ func (parent *Inode) LookUpInodeMaybeDir(name string) (*BlobItemOutput, error) {
 		if !parent.fs.flags.ExplicitDir {
 			n++
 			go func() {
-				prefixList, prefixError = RetryListBlobs(parent.fs.flags, cloud, &ListBlobsInput{
+				resp, err := RetryListBlobs(parent.fs.flags, cloud, &ListBlobsInput{
 					Delimiter: PString("/"),
 					MaxKeys:   PUInt32(1),
 					Prefix:    PString(key + "/"),
 				})
-				results <- 3
+				results <- lookupResult{kind: 3, list: resp, err: err}
 			}()
 			if parent.fs.flags.Cheap {
-				<-results
+				result := <-results
+				prefixList, prefixError = result.list, result.err
 			}
 		}
 
@@ -2081,7 +2182,15 @@ func (parent *Inode) LookUpInodeMaybeDir(name string) (*BlobItemOutput, error) {
 	for n > 0 {
 		n--
 		if !cloud.Capabilities().DirBlob && !parent.fs.flags.Cheap {
-			<-results
+			result := <-results
+			switch result.kind {
+			case 1:
+				object, objectError = result.head, result.err
+			case 2:
+				dirObject, dirError = result.head, result.err
+			case 3:
+				prefixList, prefixError = result.list, result.err
+			}
 		}
 		if object != nil {
 			return &object.BlobItemOutput, nil
