@@ -4,13 +4,16 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 	. "gopkg.in/check.v1"
@@ -30,10 +33,30 @@ func (s *GoofysTest) testReadOnlyDataCacheFuse(t *C, direct bool) {
 		_, err := s.cloud.PutBlob(&PutBlobInput{Key: name, Body: bytes.NewReader(body), Size: PUInt64(uint64(len(body)))})
 		t.Assert(err, IsNil)
 	}
-	s.fs.flags.ReadOnlyDirectIO = direct
-	s.fs.flags.MountOptions = []string{"ro"}
 	mountPoint := filepath.Join(s.tmp, "mnt"+s.fs.bucket)
-	s.mountInside(t, mountPoint)
+	// Keep the server separate from the syscall/mmap client: self-hosted FUSE
+	// can deadlock in runtime poll or GC safepoints on some kernels.
+	err := os.MkdirAll(mountPoint, 0700)
+	t.Assert(err, IsNil)
+	executable := os.Getenv("GEESEFS_BINARY")
+	if executable == "" {
+		executable = "../geesefs"
+	}
+	args := []string{"--endpoint=" + s.fs.flags.Endpoint, "--stat-cache-ttl=1h",
+		"--log-file=" + filepath.Join(s.tmp, t.TestName()+".log"), "-o", "ro"}
+	if region := os.Getenv("REGION"); region != "" {
+		args = append(args, "--region="+region)
+	}
+	if direct {
+		args = append(args, "--read-only-direct-io")
+	}
+	args = append(args, s.fs.bucket, mountPoint)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	command := exec.CommandContext(ctx, executable, args...)
+	command.Stdout, command.Stderr = os.Stdout, os.Stderr
+	err = command.Run()
+	cancel()
+	t.Assert(err, IsNil)
 	defer s.umount(t, mountPoint)
 
 	path := filepath.Join(mountPoint, "direct-data")

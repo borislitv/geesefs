@@ -62,6 +62,12 @@ A separate compatibility run in each mode used `rsync --checksum --no-whole-file
 to repair locally corrupted copies. Both reused matched data and produced the
 exact original hashes, rather than silently exercising whole-file transfers.
 
+A larger compatibility run used eight 32-MiB objects, twice the unchanged
+128-MiB cache budget, with four simultaneous rsync clients. Each mode transferred
+and verified 2 GiB across two passes, repaired the delta-transfer destinations,
+and returned the exact nginx full/range bytes. This checks a working set larger
+than the cache, not just the retained-hot-data case in the table below.
+
 | Median after warm rsync, destination removed | Default | Direct I/O |
 | --- | ---: | ---: |
 | Whole test cgroup, `memory.current` | 153.07 MiB | 89.25 MiB |
@@ -92,6 +98,10 @@ backend or mount side effects. The mounted tests `TestReadOnlyDirectIOFuse` and
 reads, empty files, reopening, private/shared mappings and rejected writes.
 Removing the direct-I/O response flag makes both the open-contract test and
 the real shared-mapping test fail.
+
+The mounted tests run the FUSE server in a separate process from the clients.
+An initial self-hosted version hung in CI; client/server separation retains the
+same assertions and passes twenty repetitions with `GOMAXPROCS=1`, `GOGC=1`.
 
 ## LIST transport and decoder
 
