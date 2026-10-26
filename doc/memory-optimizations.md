@@ -21,9 +21,9 @@ Two ownership corrections apply to this path:
   allocation accounting, and fully covered downloads retain no array.
 
 These are resource-lifetime and memory-budget corrections. They are not evidence
-of reduced steady-state RSS on a read-only workload. A configured 32-GiB data
-cache can legitimately retain approximately that much file data. The changes do
-not compress or reinterpret stored package/archive bytes.
+of reduced steady-state RSS on a read-only workload. A data cache can legitimately
+retain file data up to its configured budget. The changes do not compress or
+reinterpret stored package/archive bytes.
 
 ## LIST transport and decoder
 
@@ -89,6 +89,6 @@ GOTOOLCHAIN=go1.25.14 GOMAXPROCS=4 GOGC=20 go test -timeout 150s ./core/ycs3ext 
   binary. This is not a claim that the full integration suite passed under the
   race detector; a pre-existing NoCloud test-harness race is tracked separately.
 
-The follow-up changes were verified locally and are separate from the earlier
-`25cf10b` production canary. Live RSS or CPU observations from that canary do not
-measure this follow-up.
+The benchmark measures allocation and decoding work in an isolated fixture.
+Production RSS and throughput improvements require separate measurements under
+comparable workloads.
