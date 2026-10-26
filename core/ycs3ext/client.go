@@ -43,6 +43,10 @@ func (c *S3Client) ListObjectsV1ExtRequest(input *ListObjectsV1ExtInput) (*reque
 	}
 	output := &ListObjectsV1ExtOutput{}
 	req := c.S3.NewRequest(op, input, output)
+	// Keep SDK signing, metadata, error decoding and retry handling; replace
+	// only this operation's successful response-body decoder.
+	req.Handlers.Unmarshal.Clear()
+	req.Handlers.Unmarshal.PushBack(unmarshalListExt)
 	return req, output
 }
 

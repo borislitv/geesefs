@@ -417,6 +417,7 @@ func (inode *Inode) sendRead(cloud StorageBackend, key string, offset, size uint
 	if err != nil {
 		return 0, 0, err
 	}
+	defer resp.Body.Close()
 	for size > 0 {
 		// Read the result in smaller parts so parallelism can be utilized better
 		bs := size

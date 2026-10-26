@@ -458,8 +458,8 @@ func (l *BufferList) insertOrAppend(offset uint64, data []byte, state BufferStat
 		return
 	}
 	var newData []byte
-	allocated += int64(len(data))
 	if copyData {
+		allocated += int64(len(data))
 		newData = make([]byte, len(data))
 		copy(newData, data)
 		dataPtr = &BufferPointer{
@@ -536,6 +536,12 @@ func (l *BufferList) Add(offset uint64, data []byte, state BufferState, copyData
 	l.fill(offset, dataLen, func(curOffset, curEnd uint64) {
 		allocated += l.insertOrAppend(curOffset, data[curOffset-offset:curEnd-offset], state, copyData, dataPtr)
 	})
+	if dataPtr.refs > 0 {
+		// A downloaded buffer can be split around concurrent dirty writes.
+		// Its surviving slices retain the whole array, charged only once and
+		// released when the last reference is removed.
+		allocated += int64(len(dataPtr.mem))
+	}
 
 	return
 }

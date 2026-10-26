@@ -280,6 +280,12 @@ func (s *S3Backend) Capabilities() *Capabilities {
 
 func addAcceptEncoding(req *request.Request) {
 	if req.HTTPRequest.Method == "GET" {
+		switch req.Operation.Name {
+		case "ListObjects", "ListObjectsV2", "ListObjectsV1Ext":
+			// LIST is a protocol document, not stored object bytes. Let the
+			// HTTP transport negotiate and stream-decode gzip for these only.
+			return
+		}
 		// we need "Accept-Encoding: identity" so that objects
 		// with content-encoding won't be automatically
 		// deflated, but we don't want to sign it because GCS
