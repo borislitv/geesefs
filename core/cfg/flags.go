@@ -349,6 +349,11 @@ MISC OPTIONS:
 			Usage: "Return ENOMEM errors to applications when trying to read too many large files in parallel",
 		},
 
+		cli.BoolFlag{
+			Name:  "read-only-direct-io",
+			Usage: "Bypass the kernel data cache for reads on a read-only FUSE mount (requires -o ro); keeps the GeeseFS cache but disables shared mmap (default: off)",
+		},
+
 		cli.IntFlag{
 			Name:  "entry-limit",
 			Usage: "Maximum metadata entries to cache in memory (1 entry uses ~1 KB of memory)",
@@ -857,6 +862,7 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		// Tuning,
 		MemoryLimit:         uint64(1024 * 1024 * c.Int("memory-limit")),
 		UseEnomem:           c.Bool("use-enomem"),
+		ReadOnlyDirectIO:    c.Bool("read-only-direct-io"),
 		EntryLimit:          c.Int("entry-limit"),
 		GCInterval:          uint64(1024 * 1024 * c.Int("gc-interval")),
 		Cheap:               c.Bool("cheap"),

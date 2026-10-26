@@ -60,6 +60,7 @@ type FlagStorage struct {
 	// Tuning
 	MemoryLimit         uint64
 	UseEnomem           bool
+	ReadOnlyDirectIO    bool
 	EntryLimit          int
 	GCInterval          uint64
 	Cheap               bool

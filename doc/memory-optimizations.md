@@ -25,6 +25,74 @@ of reduced steady-state RSS on a read-only workload. A data cache can legitimate
 retain file data up to its configured budget. The changes do not compress or
 reinterpret stored package/archive bytes.
 
+## Optional kernel cache bypass
+
+`KeepPageCache=false` invalidates old kernel data when opening a file; it does
+not stop subsequent reads from populating the kernel page cache. Consequently,
+ordinary reads can retain the same payload in both GeeseFS and the kernel.
+
+`--read-only-direct-io -o ro` sets FUSE direct I/O on read-only file handles to
+avoid this second copy for ordinary reads. It is opt-in, leaves the GeeseFS
+cache budget and readahead unchanged, and requires an unambiguous read-only
+mount. Omitting `ro` or combining it with `rw` returns an error before backend
+initialization. Existing writable/create-handle behavior is unchanged.
+
+With the current FUSE dependency on Linux, shared mappings fail with `ENODEV`;
+private mappings remain supported and can populate the kernel page cache.
+Use this option only when clients do not require shared `mmap`. More FUSE
+requests may reach GeeseFS because the kernel no longer satisfies ordinary
+reads from its data cache. Compatibility and performance depend on the client,
+kernel and workload; the option is not enabled automatically.
+
+### Isolated payload measurement
+
+On 2026-10-26, Linux amd64, Go 1.25.14, five interleaved trials per mode used the
+same binary and local S3 emulator. Each trial mounted a fresh filesystem in a
+fresh cgroup v2 with a 1-GiB limit, `GOMAXPROCS=4`, `GOMEMLIMIT=512MiB`, a
+128-MiB GeeseFS data cache and a one-hour stat TTL. Eight 8-MiB objects were
+downloaded through a loopback rsync daemon, once cold and once warm.
+
+The destination was tmpfs, removed before every memory sample. Every downloaded
+object was checked against its full SHA-256. Each trial also checked an nginx
+server with `sendfile on`, a complete 8-MiB response and two byte ranges. All
+byte comparisons and ordinary unmounts passed in both modes. No GC was requested
+for the samples.
+
+A separate compatibility run in each mode used `rsync --checksum --no-whole-file`
+to repair locally corrupted copies. Both reused matched data and produced the
+exact original hashes, rather than silently exercising whole-file transfers.
+
+| Median after warm rsync, destination removed | Default | Direct I/O |
+| --- | ---: | ---: |
+| Whole test cgroup, `memory.current` | 153.07 MiB | 89.25 MiB |
+| `memory.stat`: `file - shmem` | 64.015625 MiB | 0.015625 MiB |
+| GeeseFS `HeapAlloc`, natural heap sample | 71.41 MiB | 71.32 MiB |
+
+The ordinary-read workload retained exactly 64 MiB less non-shmem file cache,
+matching the fixture payload. The Go heap was essentially unchanged: this is
+kernel-cache duplication removed, not a smaller GeeseFS cache or a demonstrated
+reduction in process RSS. Whole-cgroup savings are specific to this fixture.
+
+Cold rsync medians in this batch were 153.2 versus 189.1 MiB/s, warm medians
+239.2 versus 272.9 MiB/s. Short-run throughput varied between batches; these
+numbers do not establish a general speedup or production throughput result.
+
+To reproduce the memory comparison, use a dedicated test bucket with eight
+8-MiB objects and the same GeeseFS binary and budgets for both modes. Place the
+reader, rsync daemon and receiving client in a fresh accounting-enabled cgroup
+for each trial; keep the S3 emulator outside it. Record `memory.current` and
+`memory.stat` before reads and after removing each tmpfs destination. Compare
+`file - shmem`, not `file` alone, and retain full-file hashes. Interleave trials
+with and without `--read-only-direct-io`; do not drop global caches or force GC.
+
+`TestReadOnlyDirectIOOpen` checks access modes and default behavior.
+`TestReadOnlyDirectIORequiresReadOnlyMount` checks rejected configurations without
+backend or mount side effects. The mounted tests `TestReadOnlyDirectIOFuse` and
+`TestReadOnlyKernelCacheFuse` exercise real full, unaligned, concurrent and EOF
+reads, empty files, reopening, private/shared mappings and rejected writes.
+Removing the direct-I/O response flag makes both the open-contract test and
+the real shared-mapping test fail.
+
 ## LIST transport and decoder
 
 S3 LIST v1, v2 and ext-v1 now permit the HTTP transport's automatic gzip

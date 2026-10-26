@@ -512,14 +512,12 @@ func (fs *GoofysFuse) OpenFile(
 
 	op.Handle = fs.AddFileHandle(fh)
 
-	// this flag appears to tell the kernel if this open should
-	// use the page cache or not. "use" here means:
-	//
-	// read will read from cache
-	// write will populate cache
-
-	// We have our own in-memory cache, kernel page cache is redundant
+	// Invalidate any previous kernel data on open. This does not prevent
+	// subsequent reads from populating the kernel page cache again.
 	op.KeepPageCache = false
+	// Bypass that second cache only for explicitly opted-in read-only handles.
+	// Writable/create handles keep their existing kernel caching semantics.
+	op.UseDirectIO = fs.flags.ReadOnlyDirectIO && op.OpenFlags.IsReadOnly()
 
 	return
 }
@@ -965,12 +963,27 @@ func convertFuseOptions(flags *cfg.FlagStorage) map[string]string {
 	return optMap
 }
 
+func checkReadOnlyDirectIO(flags *cfg.FlagStorage) error {
+	if flags.ReadOnlyDirectIO {
+		options := convertFuseOptions(flags)
+		value, readOnly := options["ro"]
+		_, readWrite := options["rw"]
+		if !readOnly || value != "" || readWrite {
+			return fmt.Errorf("--read-only-direct-io requires -o ro without rw")
+		}
+	}
+	return nil
+}
+
 // Mount the file system based on the supplied arguments, returning a
 // fuse.MountedFileSystem that can be joined to wait for unmounting.
 func MountFuse(
 	ctx context.Context,
 	bucketName string,
 	flags *cfg.FlagStorage) (fs *Goofys, mfs MountedFS, err error) {
+	if err = checkReadOnlyDirectIO(flags); err != nil {
+		return
+	}
 	fs, err = NewGoofys(ctx, bucketName, flags)
 	if fs == nil {
 		if err == nil {
@@ -983,6 +996,9 @@ func MountFuse(
 }
 
 func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
+	if err = checkReadOnlyDirectIO(fs.flags); err != nil {
+		return
+	}
 	// Mount the file system.
 	mountCfg := &fuse.MountConfig{
 		FSName:                  fs.bucket,

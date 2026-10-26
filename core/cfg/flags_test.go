@@ -8,6 +8,38 @@ import (
 	"github.com/yandex-cloud/geesefs/core/cfg"
 )
 
+func TestReadOnlyDirectIO(t *testing.T) {
+	if cfg.DefaultFlags().ReadOnlyDirectIO {
+		t.Fatal("direct I/O must be opt-in")
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"default", nil, false},
+		{"enabled", []string{"--read-only-direct-io"}, true},
+		{"disabled", []string{"--read-only-direct-io=false"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := cfg.NewApp()
+			app.Writer, app.ErrWriter = io.Discard, io.Discard
+			var flags *cfg.FlagStorage
+			app.Action = func(c *cli.Context) error {
+				flags = cfg.PopulateFlags(c)
+				return nil
+			}
+			args := append([]string{"geesefs"}, tc.args...)
+			if err := app.Run(append(args, "test", "mountpoint")); err != nil {
+				t.Fatal(err)
+			}
+			if flags == nil || flags.ReadOnlyDirectIO != tc.want {
+				t.Fatalf("parsed flags = %+v, want read-only direct I/O %v", flags, tc.want)
+			}
+		})
+	}
+}
+
 func TestNegativeLookupCacheSize(t *testing.T) {
 	if got := cfg.DefaultFlags().NegativeLookupCacheSize; got != 0 {
 		t.Fatalf("default cache size = %d, want 0", got)

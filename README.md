@@ -95,6 +95,14 @@ See also [Common Issues](#common-issues).
 
 \* Partial object updates (PATCH) only work with Yandex S3.
 
+## Read-only kernel cache bypass
+
+`--read-only-direct-io -o ro` opts a read-only FUSE mount into bypassing the kernel
+data cache for ordinary reads. The GeeseFS data cache and its configured budget
+remain enabled. The option is off by default and rejects writable mounts.
+Shared `mmap` is unavailable with this option; private mappings can still populate
+the kernel cache. See [memory behavior and local measurements](doc/memory-optimizations.md#optional-kernel-cache-bypass).
+
 ## Partial object updates (PATCH)
 
 With Yandex S3 it is possible to do partial object updates (data only) without server-side copy or reupload.
